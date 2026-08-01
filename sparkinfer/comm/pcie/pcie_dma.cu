@@ -404,6 +404,46 @@ __global__ void __launch_bounds__(256, 1) dequant_store_i8_kernel(
   }
 }
 
+// Sum two compressed pair partials in fp32 and emit one compressed global
+// partial. Input/output buffers are distinct in the hierarchical schedule.
+__global__ void __launch_bounds__(256, 1) dequant2_quant_i8_kernel(
+    const signed char* __restrict__ payload_a,
+    const float* __restrict__ scales_a,
+    const signed char* __restrict__ payload_b,
+    const float* __restrict__ scales_b,
+    signed char* __restrict__ payload_out,
+    float* __restrict__ scales_out,
+    long long blocks) {
+  const int warps_per_cta = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  for (long long block = blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+       block < blocks; block += static_cast<long long>(gridDim.x) * warps_per_cta) {
+    const long long elem0 = block * kQuantBlock + lane * 4;
+    const float scale_a = scales_a[block];
+    const float scale_b = scales_b[block];
+    const float4 a = load_i8x4(payload_a + elem0);
+    const float4 b = load_i8x4(payload_b + elem0);
+    const float4 v = make_float4(
+        a.x * scale_a + b.x * scale_b,
+        a.y * scale_a + b.y * scale_b,
+        a.z * scale_a + b.z * scale_b,
+        a.w * scale_a + b.w * scale_b);
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                       fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    }
+    const float scale_out = amax > 0.0f ? amax / kInt8Max : 1.0f;
+    if (lane == 0) scales_out[block] = scale_out;
+    const float inv_scale = 1.0f / scale_out;
+    store_i8x4(
+        payload_out + elem0,
+        make_float4(v.x * inv_scale, v.y * inv_scale,
+                    v.z * inv_scale, v.w * inv_scale));
+  }
+}
+
 __global__ void __launch_bounds__(256, 1) dequant_store_mx_kernel(
     nv_bfloat16* __restrict__ out,
     const __nv_fp8_e4m3* __restrict__ payload,
@@ -723,6 +763,23 @@ static void dma_dequant_store_i8(int64_t out_ptr, int64_t payload_ptr,
       reinterpret_cast<const float*>(scales_ptr), blocks);
 }
 
+static void dma_dequant2_quant_i8(
+    int64_t payload_a_ptr, int64_t scales_a_ptr,
+    int64_t payload_b_ptr, int64_t scales_b_ptr,
+    int64_t payload_out_ptr, int64_t scales_out_ptr, int64_t elems) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const long long blocks = elems / pcie_dma::kQuantBlock;
+  const int threads = 256;
+  pcie_dma::dequant2_quant_i8_kernel<<<
+      _fp8_blocks_grid(blocks, threads), threads, 0, stream>>>(
+      reinterpret_cast<const signed char*>(payload_a_ptr),
+      reinterpret_cast<const float*>(scales_a_ptr),
+      reinterpret_cast<const signed char*>(payload_b_ptr),
+      reinterpret_cast<const float*>(scales_b_ptr),
+      reinterpret_cast<signed char*>(payload_out_ptr),
+      reinterpret_cast<float*>(scales_out_ptr), blocks);
+}
+
 static void dma_dequant_store_mx(int64_t out_ptr, int64_t payload_ptr,
                                  int64_t scales_ptr, int64_t elems) {
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -824,6 +881,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dma_dequant_store", &dma_dequant_store, "dequantize e4m3 to bf16");
   m.def("dma_dequant_store_i8", &dma_dequant_store_i8,
         "dequantize signed int8 to bf16");
+  m.def("dma_dequant2_quant_i8", &dma_dequant2_quant_i8,
+        "sum two signed-int8 partials in fp32 and requantize");
   m.def("dma_dequant_store_mx", &dma_dequant_store_mx,
         "dequantize MXFP8 to bf16");
   m.def("dma_dequant_add_quant", &dma_dequant_add_quant,
