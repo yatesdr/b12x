@@ -60,6 +60,10 @@ def _fp8_mode() -> str:
     signed-INT8 payload. Both codecs use the same layout: one payload byte
     per value plus one fp32 scale per 128 values.
 
+    "i8_hier": a four-rank, two-pair hierarchical INT8 all-reduce. It uses
+    fast intra-pair links for the first reduce-scatter and final all-gather,
+    and sends only the pair-owned half across the slower inter-pair links.
+
     "mx" / "mx_ring" / "mx_a2a": standard MXFP8, with E4M3 payload values
     and one E8M0 scale per 32 values. Four scale bytes per 128 values retain
     the same wire footprint as the other compressed codecs.
@@ -91,6 +95,14 @@ def _normalize_fp8_mode(value: str | None) -> str:
         return "i8"
     if raw in ("i8_ring", "i8-ring", "int8_ring", "int8-ring", "ring_i8"):
         return "i8_ring"
+    if raw in (
+        "i8_hier",
+        "i8-hier",
+        "int8_hier",
+        "int8-hier",
+        "hier_i8",
+    ):
+        return "i8_hier"
     if raw in ("i8_a2a", "i8-a2a", "int8_a2a", "int8-a2a", "a2a_i8"):
         return "i8_a2a"
     if raw in (
@@ -215,6 +227,8 @@ class PCIeDmaAllReduce:
         # Explicit argument wins over the environment so integrations can
         # plumb the mode through their own configuration.
         self._fp8 = _normalize_fp8_mode(fp8) if fp8 is not None else _fp8_mode()
+        if self._fp8 == "i8_hier" and self.world_size != 4:
+            raise ValueError("i8_hier requires exactly four ranks")
         self._fp8_stage = None
         self._fp8_stage_stride = 0
         if self._fp8:
@@ -231,6 +245,7 @@ class PCIeDmaAllReduce:
         wire_modes = {
             "i8": "int8-ag",
             "i8_ring": "int8-ring",
+            "i8_hier": "int8-hier",
             "i8_a2a": "int8-a2a",
             "mx": "mxfp8-ag",
             "mx_ring": "mxfp8-ring",
@@ -366,6 +381,8 @@ class PCIeDmaAllReduce:
         int8_wire = compressed_eligible and self._fp8.startswith("i8")
         mxfp8_wire = compressed_eligible and self._fp8.startswith("mx")
         wire_codec = "i8" if int8_wire else "mx" if mxfp8_wire else "e4m3"
+        if compressed_eligible and self._fp8 == "i8_hier":
+            return self._all_reduce_i8_hier(inp, out, shard_elems)
         if compressed_eligible and self._fp8 in ("a2a", "i8_a2a", "mx_a2a"):
             return self._all_reduce_fp8(inp, out, shard_elems, wire_codec=wire_codec)
         compressed_ring = compressed_eligible and self._fp8 in (
@@ -599,6 +616,189 @@ class PCIeDmaAllReduce:
         )
         ext.dma_wait_flag(
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+        return out
+
+    def _all_reduce_i8_hier(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        shard_elems: int,
+    ) -> torch.Tensor:
+        """Four-rank hierarchical INT8 all-reduce for two fast GPU pairs.
+
+        Ranks (0, 1) and (2, 3) are the intra-pair links. Each rank owns one
+        half of its pair's reduce-scatter result. Matching owners then exchange
+        and reduce those halves across pairs before an intra-pair all-gather.
+        Only half of the compressed tensor crosses the slow pair boundary.
+
+        Every rank materializes the result from the final INT8 payload. The
+        two owners of a half combine pair partials in the same canonical order,
+        which keeps the replicated BF16 result bit-identical across ranks.
+        """
+
+        if self.world_size != 4:
+            raise RuntimeError("i8_hier requires exactly four ranks")
+        ext = self._ext
+        rank = self.rank
+        pair = rank ^ 1
+        cross = rank ^ 2
+        own_half = rank & 1
+        own_chunks = (2 * own_half, 2 * own_half + 1)
+        peer_chunks = (2 * (1 - own_half), 2 * (1 - own_half) + 1)
+        chunk_bytes = shard_elems * 2
+        slice_bytes = shard_elems + shard_elems // FP8_QUANT_BLOCK * 4
+        in_base = inp.data_ptr()
+        out_base = out.data_ptr()
+        stage_base = self._fp8_stage.data_ptr()
+
+        def stage(chunk: int) -> int:
+            return stage_base + chunk * self._fp8_stage_stride
+
+        def scratch(step: int) -> int:
+            return self._scratch_ptr(rank, step)
+
+        def in_chunk(chunk: int) -> int:
+            return in_base + chunk * chunk_bytes
+
+        def out_chunk(chunk: int) -> int:
+            return out_base + chunk * chunk_bytes
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        copied = self._copied_events
+
+        # Stage 1: each rank sends the half owned by its intra-pair peer.
+        # The owner adds its BF16 local contribution and emits a compressed
+        # pair sum. This avoids an unnecessary quantization of the owner input.
+        for q, chunk in enumerate(peer_chunks):
+            payload = stage(chunk)
+            ext.dma_quant_i8(
+                in_chunk(chunk), payload, payload + shard_elems, shard_elems
+            )
+            self._a2a_qdone[q].record(main)
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(self._a2a_qdone[q])
+                ext.dma_copy(self._scratch_ptr(pair, q), payload, slice_bytes)
+                copied[q].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[q])
+                ext.dma_set_flag(
+                    self._flag_ptr(pair, q),
+                    self._counter_ptr(self._send_counters, q),
+                )
+
+        for q, chunk in enumerate(own_chunks):
+            ext.dma_wait_flag(
+                self._flag_ptr(rank, q),
+                self._counter_ptr(self._wait_counters, q),
+            )
+            remote = scratch(q)
+            pair_sum = stage(chunk)
+            ext.dma_dequant_add_quant_i8(
+                out_chunk(chunk),
+                in_chunk(chunk),
+                remote,
+                remote + shard_elems,
+                pair_sum,
+                pair_sum + shard_elems,
+                shard_elems,
+                False,
+            )
+            self._piece_events[q].record(main)
+
+        # Stage 2: exchange pair sums between matching owners. The final sum
+        # is written into the now-dead stage slots for the opposite half, so
+        # inputs and output never alias in the fused dequant/add/requant kernel.
+        for q, chunk in enumerate(own_chunks):
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(self._piece_events[q])
+                ext.dma_copy(
+                    self._scratch_ptr(cross, 2 + q), stage(chunk), slice_bytes
+                )
+                copied[2 + q].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[2 + q])
+                ext.dma_set_flag(
+                    self._flag_ptr(cross, 2 + q),
+                    self._counter_ptr(self._send_counters, 2 + q),
+                )
+
+        for q, chunk in enumerate(own_chunks):
+            ext.dma_wait_flag(
+                self._flag_ptr(rank, 2 + q),
+                self._counter_ptr(self._wait_counters, 2 + q),
+            )
+            local_pair = stage(chunk)
+            remote_pair = scratch(2 + q)
+            first, second = (
+                (local_pair, remote_pair) if rank < 2 else (remote_pair, local_pair)
+            )
+            final_payload = stage(peer_chunks[q])
+            ext.dma_dequant2_quant_i8(
+                first,
+                first + shard_elems,
+                second,
+                second + shard_elems,
+                final_payload,
+                final_payload + shard_elems,
+                shard_elems,
+            )
+            self._a2a_ownq[q].record(main)
+
+        # Stage 3: all-gather the final halves inside each fast pair. Owners
+        # and receivers both dequantize the exact same final wire payload.
+        for q, chunk in enumerate(own_chunks):
+            final_payload = stage(peer_chunks[q])
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(self._a2a_ownq[q])
+                ext.dma_copy(
+                    self._scratch_ptr(pair, 4 + q), final_payload, slice_bytes
+                )
+                copied[4 + q].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[4 + q])
+                ext.dma_set_flag(
+                    self._flag_ptr(pair, 4 + q),
+                    self._counter_ptr(self._send_counters, 4 + q),
+                )
+            ext.dma_dequant_store_i8(
+                out_chunk(chunk),
+                final_payload,
+                final_payload + shard_elems,
+                shard_elems,
+            )
+
+        for q, chunk in enumerate(peer_chunks):
+            ext.dma_wait_flag(
+                self._flag_ptr(rank, 4 + q),
+                self._counter_ptr(self._wait_counters, 4 + q),
+            )
+            final_payload = scratch(4 + q)
+            ext.dma_dequant_store_i8(
+                out_chunk(chunk),
+                final_payload,
+                final_payload + shard_elems,
+                shard_elems,
+            )
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+
+        # Pair and cross-pair handshakes prevent a faster next invocation
+        # from overwriting scratch that either peer still consumes.
+        ext.dma_set_flag(
+            self._flag_ptr(pair, 6), self._counter_ptr(self._send_counters, 6)
+        )
+        ext.dma_set_flag(
+            self._flag_ptr(cross, 7), self._counter_ptr(self._send_counters, 7)
+        )
+        ext.dma_wait_flag(
+            self._flag_ptr(rank, 6), self._counter_ptr(self._wait_counters, 6)
+        )
+        ext.dma_wait_flag(
+            self._flag_ptr(rank, 7), self._counter_ptr(self._wait_counters, 7)
         )
         return out
 

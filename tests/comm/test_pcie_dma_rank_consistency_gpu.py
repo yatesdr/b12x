@@ -8,6 +8,7 @@ Run inside the target image after installing the overlay:
     python test_pcie_dma_rank_consistency_gpu.py --mode a2a
     python test_pcie_dma_rank_consistency_gpu.py --mode i8
     python test_pcie_dma_rank_consistency_gpu.py --mode i8_ring
+    python test_pcie_dma_rank_consistency_gpu.py --mode i8_hier
     python test_pcie_dma_rank_consistency_gpu.py --mode i8_a2a
     python test_pcie_dma_rank_consistency_gpu.py --mode mx
     python test_pcie_dma_rank_consistency_gpu.py --mode mx_ring
@@ -139,6 +140,7 @@ def main() -> None:
             "a2a",
             "i8",
             "i8_ring",
+            "i8_hier",
             "i8_a2a",
             "mx",
             "mx_ring",

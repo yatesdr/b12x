@@ -127,6 +127,8 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     world_size = int(os.getenv("SPARKINFER_PCIE_DMA_WORLD_SIZE", "2"))
+    if mode == "i8_hier" and world_size != 4:
+        pytest.skip("i8_hier requires SPARKINFER_PCIE_DMA_WORLD_SIZE=4")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
@@ -149,6 +151,7 @@ def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
         "i8",
         "i8_a2a",
         "i8_ring",
+        "i8_hier",
         "mx",
         "mx_a2a",
         "mx_ring",
